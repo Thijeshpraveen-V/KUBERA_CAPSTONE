@@ -1,0 +1,901 @@
+"""
+Admin Routes
+Endpoints for admin operations (15+ endpoints)
+"""
+
+from fastapi import APIRouter, Depends, status, Path, Query
+from typing import Dict, Any, Optional
+from app.db.repositories.rate_limit_repository import RateLimitRepository
+from app.db.repositories.system_repository import SystemRepository    
+from app.db.repositories.admin_repository import AdminRepository
+from datetime import datetime
+
+
+from app.schemas.requests.admin_requests import (
+    AdminLoginSendOTPRequest,
+    AdminLoginVerifyOTPRequest,
+    UpdateRateLimitGlobalRequest,
+    UpdateRateLimitUserRequest,
+    WhitelistUserRequest,
+    UpdatePortfolioReportSettingsRequest,
+    DeactivateUserRequest,
+    SystemControlRequest
+)
+from app.schemas.responses.admin_responses import (
+    AdminTokenResponse,
+    DashboardStatsResponse,
+    UserListResponse,
+    UserDetailResponse,
+    RateLimitConfigResponse,
+    UpdateRateLimitResponse,
+    PortfolioReportSettingsResponse,
+    UpdatePortfolioReportResponse,
+    DeactivateUserResponse,
+    SystemControlResponse,
+    RateLimitViolationsListResponse,
+    ActivityLogListResponse,
+    PromptActivityResponse
+)
+from app.services.admin_service import AdminService
+from app.services.rate_limit_service import RateLimitService
+from app.core.dependencies import get_current_admin, get_current_super_admin
+from app.core.database import get_db_pool
+
+router = APIRouter(prefix="/admin", tags=["Admin"])
+
+
+# ============================================================================
+# ADMIN AUTHENTICATION
+# ============================================================================
+
+@router.post(
+    "/login/send-otp",
+    status_code=status.HTTP_200_OK,
+    summary="Admin login - Send OTP",
+    description="Send OTP to admin email for login"
+)
+async def admin_login_send_otp(request: AdminLoginSendOTPRequest):
+    """
+    **Admin Login: Step 1 - Send OTP**
+    
+    - Validates admin email exists
+    - Sends 6-digit OTP to admin email
+    - OTP expires in 10 minutes
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    result = await admin_service.admin_login_send_otp(request.email)
+    return result
+
+
+@router.post(
+    "/login/verify-otp",
+    response_model=AdminTokenResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Admin login - Verify OTP",
+    description="Verify OTP and receive admin access token"
+)
+async def admin_login_verify_otp(request: AdminLoginVerifyOTPRequest):
+    """
+    **Admin Login: Step 2 - Verify OTP**
+    
+    - Verifies OTP
+    - Returns admin access token
+    - Token expires in 24 hours
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    result = await admin_service.admin_login_verify_otp(request.email, request.otp)
+    return result
+
+
+# ============================================================================
+# DASHBOARD
+# ============================================================================
+
+@router.get(
+    "/dashboard",
+    response_model=DashboardStatsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get dashboard statistics",
+    description="Get comprehensive admin dashboard statistics"
+)
+async def get_dashboard_stats(current_admin: Dict = Depends(get_current_admin)):
+    """
+    **Admin Dashboard Statistics**
+    
+    Returns comprehensive stats:
+    - Total users, active, deactivated
+    - Total chats and messages
+    - Prompt usage (today, week, month)
+    - Rate limit violations
+    - System status
+    - Portfolio report settings
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    stats = await admin_service.get_dashboard_stats()
+    return stats
+
+
+@router.get(
+    "/dashboard/prompt-activity",
+    response_model=PromptActivityResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get prompt activity time-series",
+    description="Get prompt counts over time for charting"
+)
+async def get_prompt_activity(
+    period: str = Query("24h", description="Time period: 24h, 7d, or 30d"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Prompt Activity Time-Series**
+    
+    Returns prompt counts grouped by time intervals:
+    - **24h**: Last 24 hours, hourly data points
+    - **7d**: Last 7 days, daily data points
+    - **30d**: Last 30 days, daily data points
+    """
+    from app.db.repositories.chat_repository import ChatRepository
+    
+    if period not in ["24h", "7d", "30d"]:
+        period = "24h"
+    
+    db_pool = await get_db_pool()
+    chat_repo = ChatRepository(db_pool)
+    
+    data = await chat_repo.get_prompt_activity_timeseries(period)
+    
+    return {
+        "success": True,
+        "period": period,
+        "data": data
+    }
+
+
+# ============================================================================
+# USER MANAGEMENT
+# ============================================================================
+
+@router.get(
+    "/users",
+    response_model=UserListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get all users",
+    description="Get list of all users with pagination"
+)
+async def get_all_users(
+    limit: int = Query(100, ge=1, le=500, description="Number of users"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    account_status: Optional[str] = Query(None, description="Filter by status: active, deactivated, suspended"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Get All Users**
+    
+    - Paginated user list
+    - Filter by account status
+    - Includes basic user info and stats
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    result = await admin_service.get_all_users(limit, offset, account_status)
+    return result
+
+
+@router.get(
+    "/users/{user_id}",
+    response_model=UserDetailResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get user details",
+    description="Get detailed information about a specific user"
+)
+async def get_user_detail(
+    user_id: str = Path(..., description="User UUID"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Get User Details**
+    
+    Returns comprehensive user information:
+    - Profile details
+    - Usage statistics
+    - Rate limit info
+    - Portfolio count
+    - Recent activity
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    # Use the service method that handles UUID conversion
+    user = await admin_service.get_user_detail(user_id)
+    return user
+
+
+@router.put(
+    "/users/{user_id}/deactivate",
+    response_model=DeactivateUserResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Deactivate user",
+    description="Deactivate a user account"
+)
+async def deactivate_user(
+    user_id: str = Path(..., description="User UUID"),
+    request: DeactivateUserRequest = None,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Deactivate User**
+    
+    - Sets account status to 'deactivated'
+    - User cannot login
+    - Sends notification email to user
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    user = await admin_service.deactivate_user(
+        user_id,
+        current_admin["admin_id"],
+        request.reason if request else None
+    )
+    
+    return {
+        "success": True,
+        "message": "User deactivated successfully",
+        "user_id": user_id,
+        "new_status": "deactivated"
+    }
+
+
+@router.put(
+    "/users/{user_id}/reactivate",
+    status_code=status.HTTP_200_OK,
+    summary="Reactivate user",
+    description="Reactivate a deactivated user account"
+)
+async def reactivate_user(
+    user_id: str = Path(..., description="User UUID"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Reactivate User**
+    
+    - Sets account status to 'active'
+    - User can login again
+    - Sends notification email
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    user = await admin_service.reactivate_user(user_id, current_admin["admin_id"])
+    
+    return {
+        "success": True,
+        "message": "User reactivated successfully",
+        "user_id": user_id,
+        "new_status": "active"
+    }
+
+
+# ============================================================================
+# RATE LIMIT MANAGEMENT
+# ============================================================================
+
+@router.get(
+    "/rate-limits/config",
+    response_model=RateLimitConfigResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get rate limit configuration",
+    description="Get current global and user-specific rate limits"
+)
+async def get_rate_limit_config(current_admin: Dict = Depends(get_current_admin)):
+    """
+    **Get Rate Limit Configuration**
+    
+    Returns:
+    - Global rate limits (burst, per-chat, hourly, daily)
+    - User-specific overrides
+    - Whitelisted users
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    config = await rate_limit_service.get_rate_limit_config()
+    return config
+
+
+@router.put(
+    "/rate-limits/global",
+    response_model=UpdateRateLimitResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update global rate limits",
+    description="Update global rate limit settings"
+)
+async def update_global_rate_limits(
+    request: UpdateRateLimitGlobalRequest,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Update Global Rate Limits**
+    
+    - Updates default rate limits for all users
+    - Does not affect user-specific overrides
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    updates = request.dict(exclude_unset=True)
+    config = await rate_limit_service.update_global_rate_limits(
+        updates,
+        current_admin["admin_id"]
+    )
+    
+    return {
+        "success": True,
+        "message": "Global rate limits updated successfully",
+        "config": config
+    }
+
+
+@router.put(
+    "/rate-limits/user/{user_id}",
+    response_model=UpdateRateLimitResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Set user-specific rate limits",
+    description="Set custom rate limits for a specific user"
+)
+async def set_user_rate_limits(
+    user_id: str = Path(..., description="User UUID"),
+    request: UpdateRateLimitUserRequest = None,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Set User-Specific Rate Limits**
+    
+    - Override global limits for specific user
+    - Higher or lower limits than default
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    limits = request.dict(exclude_unset=True)
+    await rate_limit_service.set_user_rate_limits(
+        user_id,
+        limits,
+        current_admin["admin_id"]
+    )
+    
+    config = await rate_limit_service.get_rate_limit_config()
+    
+    return {
+        "success": True,
+        "message": "User rate limits updated successfully",
+        "config": config
+    }
+
+
+@router.post(
+    "/rate-limits/whitelist",
+    status_code=status.HTTP_200_OK,
+    summary="Add user to whitelist",
+    description="Add user to whitelist (no rate limits)"
+)
+async def whitelist_user(
+    request: WhitelistUserRequest,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Whitelist User**
+    
+    - User bypasses all rate limits
+    - Use for VIP users or testing
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    await rate_limit_service.whitelist_user(request.user_id, current_admin["admin_id"])
+    
+    return {
+        "success": True,
+        "message": "User whitelisted successfully",
+        "user_id": request.user_id
+    }
+
+
+@router.delete(
+    "/rate-limits/whitelist/{user_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Remove user from whitelist",
+    description="Remove user from whitelist"
+)
+async def remove_whitelist(
+    user_id: str = Path(..., description="User UUID"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Remove User from Whitelist**
+    
+    - User will be subject to rate limits again
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    await rate_limit_service.remove_whitelist(user_id, current_admin["admin_id"])
+    
+    return {
+        "success": True,
+        "message": "User removed from whitelist",
+        "user_id": user_id
+    }
+
+
+@router.post(
+    "/rate-limits/reset/{user_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Reset user rate limit counters",
+    description="Reset all rate limit counters for a user"
+)
+async def reset_user_rate_limits(
+    user_id: str = Path(..., description="User UUID"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Reset User Rate Limit Counters**
+    
+    - Resets all counters (burst, hourly, daily)
+    - User can send prompts again immediately
+    - Use for support/troubleshooting
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    await rate_limit_service.reset_user_limits(user_id)
+    
+    return {
+        "success": True,
+        "message": "User rate limit counters reset",
+        "user_id": user_id
+    }
+
+
+# ============================================================================
+# RATE LIMIT VIOLATIONS
+# ============================================================================
+
+@router.get(
+    "/rate-limits/violations",
+    response_model=RateLimitViolationsListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get rate limit violations",
+    description="Get list of rate limit violations"
+)
+async def get_violations(
+    limit: int = Query(100, ge=1, le=500, description="Number of violations"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    violation_type: Optional[str] = Query(None, description="Filter by type: burst, per_chat, hourly, daily"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Get Rate Limit Violations**
+    
+    - List of all rate limit violations
+    - Filter by violation type
+    - Includes user info and timestamps
+    """
+    db_pool = await get_db_pool()
+    rate_limit_service = RateLimitService(db_pool)
+    
+    violations = await rate_limit_service.get_violations(limit, offset, violation_type)
+    
+    rate_limit_repo = RateLimitRepository(db_pool)
+    total = await rate_limit_repo.count_violations()
+    
+    return {
+        "success": True,
+        "total_violations": total,
+        "violations": violations
+    }
+
+
+# ============================================================================
+# PORTFOLIO REPORT SETTINGS
+# ============================================================================
+
+@router.get(
+    "/portfolio-reports/settings",
+    response_model=PortfolioReportSettingsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get portfolio report settings",
+    description="Get current portfolio report schedule settings"
+)
+async def get_portfolio_report_settings(current_admin: Dict = Depends(get_current_admin)):
+    """
+    **Get Portfolio Report Settings**
+    
+    - Frequency (disabled, daily, weekly, monthly)
+    - Send time
+    - Day of week/month
+    - Next scheduled run
+    """
+    db_pool = await get_db_pool()
+    
+    system_repo = SystemRepository(db_pool)
+    system_status = await system_repo.get_system_status()
+    
+    # ========================================================================
+    # FIX: Convert time and int to strings
+    # ========================================================================
+    send_time = system_status['portfolio_report_send_time']
+    if send_time and hasattr(send_time, 'isoformat'):
+        send_time = send_time.isoformat()
+    
+    return {
+        "frequency": system_status['portfolio_report_frequency'],
+        "send_time": send_time,
+        "send_day_weekly": str(system_status['portfolio_report_send_day_weekly']) if system_status['portfolio_report_send_day_weekly'] is not None else None,
+        "send_day_monthly": str(system_status['portfolio_report_send_day_monthly']) if system_status['portfolio_report_send_day_monthly'] is not None else None,
+        "timezone": "Asia/Kolkata",
+        "last_sent": system_status['portfolio_report_last_sent'],
+        "next_scheduled": system_status['portfolio_report_next_scheduled']
+    }
+
+
+@router.put(
+    "/portfolio-reports/settings",
+    response_model=UpdatePortfolioReportResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update portfolio report settings",
+    description="Update portfolio report schedule"
+)
+async def update_portfolio_report_settings(
+    request: UpdatePortfolioReportSettingsRequest,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Update Portfolio Report Settings**
+    
+    - Set frequency (disabled, daily, weekly, monthly)
+    - Set send time (IST)
+    - Set day for weekly/monthly reports
+    - Updates the scheduler job
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    
+    system_repo = SystemRepository(db_pool)
+    
+    # Convert send_time string to time object for database
+    from datetime import time as dt_time
+    time_parts = request.send_time.split(":")
+    send_time_obj = dt_time(int(time_parts[0]), int(time_parts[1]), int(time_parts[2]) if len(time_parts) > 2 else 0)
+    
+    # Capture old settings BEFORE overwriting (for the activity log)
+    existing = await system_repo.get_system_status()
+    old_send_time = existing.get('portfolio_report_send_time') if existing else None
+    old_value = {
+        "frequency":        existing.get('portfolio_report_frequency') if existing else None,
+        "send_time":        old_send_time.strftime('%H:%M') if old_send_time else None,
+        "send_day_weekly":  existing.get('portfolio_report_send_day_weekly') if existing else None,
+        "send_day_monthly": existing.get('portfolio_report_send_day_monthly') if existing else None,
+    }
+
+    # Null out the irrelevant day field based on frequency
+    # so the DB never holds stale day values for the inactive schedule type
+    if request.frequency == "monthly":
+        day_weekly_to_save  = None                    # irrelevant for monthly
+        day_monthly_to_save = request.send_day_monthly
+    elif request.frequency == "weekly":
+        day_weekly_to_save  = request.send_day_weekly
+        day_monthly_to_save = None                    # irrelevant for weekly
+    else:  # daily / disabled
+        day_weekly_to_save  = None
+        day_monthly_to_save = None
+
+    # Map request fields to database column names
+    settings_dict = {
+        'portfolio_report_frequency':        request.frequency,
+        'portfolio_report_send_time':        send_time_obj,
+        'portfolio_report_send_day_weekly':  day_weekly_to_save,
+        'portfolio_report_send_day_monthly': day_monthly_to_save,
+    }
+    updated = await system_repo.update_portfolio_report_settings(settings_dict)
+    
+    # ========================================================================
+    # Update the background scheduler with the new schedule
+    # ========================================================================
+    next_run_time = None
+    try:
+        from app.background.scheduler import background_scheduler
+        next_run_time = await background_scheduler.update_portfolio_report_schedule(
+            frequency=request.frequency,
+            send_time=request.send_time,
+            day_weekly=request.send_day_weekly,
+            day_monthly=request.send_day_monthly
+        )
+        
+        # Update the next_scheduled in the database
+        if next_run_time:
+            await system_repo.update_portfolio_report_settings({
+                'portfolio_report_next_scheduled': next_run_time
+            })
+            # Refresh the updated dict
+            updated = await system_repo.get_system_status()
+    except Exception as e:
+        # Log error but don't fail the request - settings are saved
+        print(f"Warning: Failed to update scheduler: {e}")
+    
+    # ========================================================================
+    # Log admin action
+    # ========================================================================
+    try:
+        admin_repo = AdminRepository(db_pool)
+        await admin_repo.log_admin_action(
+            admin_id=current_admin["admin_id"],
+            action="portfolio_report_settings_updated",
+            target_type="system",
+            target_id=None,
+            old_value=old_value,
+            new_value={
+                "frequency":        request.frequency,
+                "send_time":        request.send_time,
+                "send_day_weekly":  day_weekly_to_save,   # actual saved value, not raw request
+                "send_day_monthly": day_monthly_to_save   # actual saved value, not raw request
+            }
+        )
+    except Exception as e:
+        print(f"Warning: Failed to log admin action: {e}")
+    
+    # ========================================================================
+    # FIX: Convert time and int to strings
+    # ========================================================================
+    send_time = updated['portfolio_report_send_time']
+    if send_time and hasattr(send_time, 'isoformat'):
+        send_time = send_time.isoformat()
+    
+    return {
+        "success": True,
+        "message": "Portfolio report settings updated successfully",
+        "settings": {
+            "frequency": updated['portfolio_report_frequency'],
+            "send_time": send_time,
+            "send_day_weekly": str(updated['portfolio_report_send_day_weekly']) if updated['portfolio_report_send_day_weekly'] is not None else None,
+            "send_day_monthly": str(updated['portfolio_report_send_day_monthly']) if updated['portfolio_report_send_day_monthly'] is not None else None,
+            "timezone": "Asia/Kolkata",
+            "last_sent": updated['portfolio_report_last_sent'],
+            "next_scheduled": updated['portfolio_report_next_scheduled']
+        }
+    }
+
+
+
+# ============================================================================
+# SYSTEM CONTROL
+# ============================================================================
+
+@router.post(
+    "/system/control",
+    response_model=SystemControlResponse,
+    status_code=status.HTTP_200_OK,
+    summary="System control",
+    description="Stop, start, or restart the system"
+)
+async def system_control(
+    request: SystemControlRequest,
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **System Control**
+    
+    Actions:
+    - **stop**: Stop accepting new prompts (maintenance mode)
+    - **start**: Resume normal operations
+    - **restart**: Restart system services
+    
+    - Sends notification email to all users
+    - Logs admin action
+    """
+    db_pool = await get_db_pool()
+    admin_service = AdminService(db_pool)
+    
+    result = await admin_service.system_control(
+        request.action,
+        current_admin["admin_id"],
+        request.reason
+    )
+    
+    
+    return {
+        "success": True,
+        "message": f"System {request.action} completed",
+        "action": request.action,
+        "system_status": result['current_status'],
+        "timestamp": datetime.now()
+    }
+
+
+# ============================================================================
+# ACTIVITY LOGS
+# ============================================================================
+
+@router.get(
+    "/activity-logs",
+    response_model=ActivityLogListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get admin activity logs",
+    description="Get audit trail of admin actions"
+)
+async def get_activity_logs(
+    limit: int = Query(100, ge=1, le=500, description="Number of logs"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+    admin_id: Optional[str] = Query(None, description="Filter by admin ID"),
+    action: Optional[str] = Query(None, description="Filter by action type"),
+    current_admin: Dict = Depends(get_current_admin)
+):
+    """
+    **Get Admin Activity Logs**
+    
+    - Complete audit trail of admin actions
+    - Filter by admin or action type
+    - Includes old/new values for changes
+    """
+    try:
+        db_pool = await get_db_pool()
+        
+        admin_repo = AdminRepository(db_pool)
+        
+        logs = await admin_repo.get_activity_logs(limit, offset, admin_id, action)
+        total = await admin_repo.count_activity_logs(admin_id)
+        
+        return {
+            "success": True,
+            "total_logs": total,
+            "logs": logs
+        }
+    except Exception as e:
+        # Handle database errors gracefully (e.g., table doesn't exist yet)
+        print(f"Error fetching activity logs: {e}")
+        return {
+            "success": True,
+            "total_logs": 0,
+            "logs": []
+        }
+
+
+# ============================================================================
+# SUPER ADMIN — ADMIN MANAGEMENT
+# (Only accessible to admins with is_super_admin = True)
+# ============================================================================
+
+@router.get(
+    "/admins",
+    status_code=status.HTTP_200_OK,
+    summary="List all admins [Super Admin only]",
+    description="Returns all normal (non-super) admin accounts"
+)
+async def list_admins(current_admin: Dict = Depends(get_current_super_admin)):
+    """
+    **List Normal Admins** — Super Admin only
+
+    - Returns all admins where is_super_admin = False
+    - Includes active/inactive status
+    """
+    db_pool = await get_db_pool()
+    from app.db.repositories.admin_repository import AdminRepository
+    admin_repo = AdminRepository(db_pool)
+    admins = await admin_repo.get_all_admins()
+    return {
+        "success": True,
+        "total_admins": len(admins),
+        "admins": admins
+    }
+
+
+@router.put(
+    "/admins/{admin_id}/deactivate",
+    status_code=status.HTTP_200_OK,
+    summary="Deactivate an admin [Super Admin only]",
+    description="Set is_active = False for the given admin"
+)
+async def deactivate_admin(
+    admin_id: str = Path(..., description="Admin UUID"),
+    current_admin: Dict = Depends(get_current_super_admin)
+):
+    """
+    **Deactivate Admin** — Super Admin only
+
+    - Sets is_active = False
+    - Admin will be blocked from logging in
+    - Logs action
+    """
+    db_pool = await get_db_pool()
+    from app.db.repositories.admin_repository import AdminRepository
+    from app.services.email_service import EmailService
+    admin_repo = AdminRepository(db_pool)
+    updated = await admin_repo.update_admin_status(admin_id, False)
+    if not updated:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Admin not found")
+    # Log action
+    import json
+    await admin_repo.log_activity({
+        "admin_id": current_admin["admin_id"],
+        "action": "admin_deactivated",
+        "target_type": "admin",
+        "target_id": admin_id,
+        "new_value": json.dumps({"is_active": False})
+    })
+    # Send deactivation email to the affected admin
+    try:
+        email_service = EmailService(db_pool)
+        await email_service.send_account_deactivated_email(
+            user=updated,  # has full_name and email
+            reason="Your admin account has been deactivated by a super admin."
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send admin deactivation email: {e}")
+    return {
+        "success": True,
+        "message": "Admin deactivated successfully",
+        "admin_id": admin_id,
+        "is_active": False
+    }
+
+
+@router.put(
+    "/admins/{admin_id}/reactivate",
+    status_code=status.HTTP_200_OK,
+    summary="Reactivate an admin [Super Admin only]",
+    description="Set is_active = True for the given admin"
+)
+async def reactivate_admin(
+    admin_id: str = Path(..., description="Admin UUID"),
+    current_admin: Dict = Depends(get_current_super_admin)
+):
+    """
+    **Reactivate Admin** — Super Admin only
+
+    - Sets is_active = True
+    - Admin can log in again
+    - Logs action
+    """
+    db_pool = await get_db_pool()
+    from app.db.repositories.admin_repository import AdminRepository
+    from app.services.email_service import EmailService
+    admin_repo = AdminRepository(db_pool)
+    updated = await admin_repo.update_admin_status(admin_id, True)
+    if not updated:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Admin not found")
+    # Log action
+    import json
+    await admin_repo.log_activity({
+        "admin_id": current_admin["admin_id"],
+        "action": "admin_reactivated",
+        "target_type": "admin",
+        "target_id": admin_id,
+        "new_value": json.dumps({"is_active": True})
+    })
+    # Send reactivation email to the affected admin
+    try:
+        email_service = EmailService(db_pool)
+        await email_service.send_account_reactivated_email(user=updated)
+    except Exception as e:
+        logger.warning(f"Failed to send admin reactivation email: {e}")
+    return {
+        "success": True,
+        "message": "Admin reactivated successfully",
+        "admin_id": admin_id,
+        "is_active": True
+    }
